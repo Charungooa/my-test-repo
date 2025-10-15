@@ -1,0 +1,136 @@
+name: Build and Deploy to AKS
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+    inputs:
+      namespace:
+        description: 'Kubernetes namespace to deploy to'
+        required: true
+        default: 'default'
+        type: string
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+
+env:
+  ACR_NAME: mycontainerregistry
+  ACR_LOGIN_SERVER: mycontainerregistry.azurecr.io
+  IMAGE_NAME: webapp
+  AKS_CLUSTER_NAME: my-aks-cluster
+  AKS_RESOURCE_GROUP: my-resource-group
+  MANIFEST_PATH: k8s/deployment.yaml
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Generate image tag
+        id: image_tag
+        run: |
+          SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          IMAGE_TAG="${{ github.ref_name }}-${SHORT_SHA}-${TIMESTAMP}"
+          echo "tag=${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "full_image=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image_tag.outputs.full_image }}
+            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=registry,ref=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Update Kubernetes manifest
+        run: |
+          sed -i "s|image:.*|image: ${{ steps.image_tag.outputs.full_image }}|g" ${{ env.MANIFEST_PATH }}
+          cat ${{ env.MANIFEST_PATH }}
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.AKS_RESOURCE_GROUP }}
+          cluster-name: ${{ env.AKS_CLUSTER_NAME }}
+
+      - name: Verify AKS context
+        run: |
+          kubectl config current-context
+          kubectl cluster-info
+
+      - name: Set namespace variable
+        id: namespace
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            NAMESPACE="${{ github.event.inputs.namespace }}"
+          else
+            case "${{ github.ref_name }}" in
+              main)
+                NAMESPACE="production"
+                ;;
+              develop)
+                NAMESPACE="development"
+                ;;
+              *)
+                NAMESPACE="staging"
+                ;;
+            esac
+          fi
+          echo "namespace=${NAMESPACE}" >> $GITHUB_OUTPUT
+          echo "Deploying to namespace: ${NAMESPACE}"
+
+      - name: Create namespace if not exists
+        run: |
+          kubectl create namespace ${{ steps.namespace.outputs.namespace }} --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to AKS
+        run: |
+          kubectl apply -f ${{ env.MANIFEST_PATH }} --namespace=${{ steps.namespace.outputs.namespace }}
+          kubectl rollout status deployment/${{ env.IMAGE_NAME }} --namespace=${{ steps.namespace.outputs.namespace }} --timeout=5m
+
+      - name: Verify deployment
+        run: |
+          kubectl get pods --namespace=${{ steps.namespace.outputs.namespace }}
+          kubectl get services --namespace=${{ steps.namespace.outputs.namespace }}
+
+      - name: Deployment summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image**: ${{ steps.image_tag.outputs.full_image }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Namespace**: ${{ steps.namespace.outputs.namespace }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cluster**: ${{ env.AKS_CLUSTER_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
