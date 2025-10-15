@@ -11,7 +11,11 @@ on:
         description: 'Kubernetes namespace to deploy to'
         required: true
         default: 'default'
-        type: string
+        type: choice
+        options:
+          - test
+          - stage
+          - live
       environment:
         description: 'Deployment environment'
         required: true
